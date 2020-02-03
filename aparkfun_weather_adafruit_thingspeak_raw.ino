@@ -1,3 +1,7 @@
+#define ENABLE_WATCHDOG
+#ifdef ENABLE_WATCHDOG
+#include <avr/wdt.h>
+#endif
 
 #include <Adafruit_CC3000.h>
 #include <ccspi.h>
@@ -29,6 +33,7 @@ float humidity;
 float temp_p;
 float temp_h;
 float pressure;
+float pressure_mmHg;
 
 /* Adafruit */
 
@@ -51,12 +56,16 @@ Adafruit_CC3000_Client adafruitNativeClient;
 #define THINGSPEAK_URL "api.thingspeak.com"
 #define THINGSPEAK_PORT_NUMBER 80
 
-
 void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
-void setup() {
-  Serial.begin(115200);
+volatile int wdtInterruptsCount = 0;
+//300 interrupts = 300 seconds
+#define NO_DATA_INTERRUPTS_COUNT 300
 
+void setup() {
+  watchdogDisable();
+  Serial.begin(115200);
+  Serial.println("Weather Shield setup.");
   pinMode(STAT_BLUE, OUTPUT); //Status LED Blue
   pinMode(STAT_GREEN, OUTPUT); //Status LED Green
 
@@ -71,6 +80,7 @@ void setup() {
 
   api_lasttime = millis() - api_mtbs;
   Serial.println("Weather Shield online!");
+  watchdogEnable();
 }
 
 void loop() {
@@ -81,7 +91,7 @@ void loop() {
     if (!wirelessConnectionIsUp()) {
       Serial.println("Wireless connection is down. reconnecting...");
       wirelessStopAndReboot();
-      wirelessConnect(); 
+      wirelessConnect();
     }
  
     updateWeatherData();
@@ -93,6 +103,7 @@ void loop() {
     } else {
       displayWeatherData();
       writeWeatherDataToThingSpeak();
+      watchdogReset();
     }
     digitalWrite(STAT_BLUE, LOW); //Turn off stat LED
   }
@@ -114,6 +125,7 @@ void updateWeatherData() {
   humidity = myHumidity.readHumidity();
   temp_h = myHumidity.readTemperature();
   pressure = myPressure.readPressure();
+  pressure_mmHg = pressure / 133.32;
   temp_p = myPressure.readTemp();
 }
 
@@ -129,6 +141,7 @@ void displayWeatherData() {
   //Check Pressure Sensor
   
   Serial.print(F(" Pressure = "));
+  
   Serial.print(pressure);
   Serial.print(F("Pa,"));
   
@@ -151,33 +164,74 @@ void wirelessStopAndReboot() {
 }
 
 void wirelessConnect() {
-   /* Initialise the module */
-  Serial.println(F("\nInitializing..."));
-  if (!cc3000.begin())
-  {
+  /* Initialise the module */
+  Serial.println(F("\nInitializing wireless shield..."));
+  if (!cc3000.begin()) {
     Serial.println(F("Couldn't begin()! Check your wiring?"));
     while(1);
   }
-  
   Serial.print(F("\nAttempting to connect to ")); Serial.println(WLAN_SSID);
   if (!cc3000.connectToAP(WLAN_SSID, WLAN_PASS, WLAN_SECURITY)) {
     Serial.println(F("Failed!"));
     while(1);
   }
-   
+ 
   Serial.println(F("Connected!"));
   
   /* Wait for DHCP to complete */
   Serial.println(F("Request DHCP"));
-  while (!cc3000.checkDHCP())
-  {
+  while (!cc3000.checkDHCP()) {
     delay(100); // ToDo: Insert a DHCP timeout!
   }  
 
   /* Display the IP address DNS, Gateway, etc. */  
   while (! displayConnectionDetails()) {
-    delay(1000);
+    delay(100);
   }
+}
+
+ISR(WDT_vect)
+{
+  ++wdtInterruptsCount;
+  if (wdtInterruptsCount >= NO_DATA_INTERRUPTS_COUNT) { /* if wdt interrupts count is >= NO_DATA_INTERRUPTS_COUNT restart arduino*/
+    resetFunc();
+  }
+}
+
+
+void watchdogEnable() {
+  #ifdef ENABLE_WATCHDOG
+  Serial.println(F("Enabling watchdog"));
+  //wdt_enable(WDTO_8S);
+
+  //Register fuer Watchdog Time-out Interrupt setzen
+  cli();
+  wdt_reset(); // Reset Watchdog Timer
+  MCUSR &= ~(1 << WDRF); //Rücksetzen des Watchdog System Reset Flag
+  WDTCSR = (1 << WDCE) | (1 << WDE); //Watchdog Change Enable
+  //WDTCSR = (1 << WDP3); //Watchdog Zyklus = 4 s
+  WDTCSR = (1 << WDP2) | (1<<WDP1) ; //Watchdog Zyklus = 1 s
+  WDTCSR |= (1 << WDIE); //Watchdog Interrupt enable
+
+  //WDTCSR = (1<<WDIE) | (0<<WDP3) | (1<<WDP2) | (1<<WDP1) | (0<<WDP0);
+  sei();
+  watchdogReset();
+  #endif
+}
+
+
+void watchdogDisable() {
+  #ifdef ENABLE_WATCHDOG
+  Serial.println(F("Disabling watchdog"));
+  wdt_disable();
+  #endif
+}
+
+void watchdogReset() {
+  #ifdef ENABLE_WATCHDOG
+  wdt_reset();
+  wdtInterruptsCount = 0;
+  #endif
 }
 
 void writeWeatherDataToThingSpeak() {
@@ -189,11 +243,10 @@ void writeWeatherDataToThingSpeak() {
       Serial.println(F("Couldn't resolve!"));
       return;
     }
-    delay(500);
+    delay(100);
   }
-
   cc3000.printIPdotsRev(ip);
-  String tsData = "field1=" + String(temp_p) + "&field2=" + String(temp_h) + "&field3=" + String(pressure)  + "&field4=" + String(humidity);
+  String tsData = "field1=" + String(temp_p) + "&field2=" + String(temp_h) + "&field3=" + String(pressure)  + "&field4=" + String(humidity) + "&field7=" + String(pressure_mmHg);
   Adafruit_CC3000_Client www = cc3000.connectTCP(ip, THINGSPEAK_PORT_NUMBER);
   if (www.connected()) {
     www.fastrprint(F("POST /update HTTP/1.1\n"));
